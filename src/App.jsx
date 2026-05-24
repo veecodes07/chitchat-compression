@@ -4,23 +4,34 @@ import createFold from "@vedsu/foldin";
 const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY;
 const CHAT_MODEL = "llama-3.3-70b-versatile";
 const COMPRESS_MODEL = "llama-3.1-8b-instant";
-// const CHAT_MODEL = "qwen/qwen3-coder:free";
-// const COMPRESS_MODEL = "qwen/qwen3-coder:free"; 
 const CONVERSATION_ID = "chat-001";
 
-// ─── In-memory storage ────────────────────────────────────────────────────────
-const db = new Map();
+// ─── localStorage storage (survives Vite HMR reloads) ────────────────────────
 const storage = {
-  get: async (id) => db.get(id) ?? null,
-  set: async (id, state) => db.set(id, state),
+  get: async (id) => {
+    const val = localStorage.getItem(`foldin:${id}`);
+    return val ? JSON.parse(val) : null;
+  },
+  set: async (id, state) => {
+    localStorage.setItem(`foldin:${id}`, JSON.stringify(state));
+  },
 };
+
+function handleNewChat() {
+  fold.reset(CONVERSATION_ID);
+  localStorage.removeItem(`foldin:${CONVERSATION_ID}`);
+  setMessages([]);
+  setStats(null);
+  setTotalSaved(0);
+  cumulativeRaw.current = 0;
+  cumulativeSent.current = 0;
+}
 
 // ─── Compress function ────────────────────────────────────────────────────────
 const compress = async (prompt) => {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
-      // 
       "Authorization": `Bearer ${import.meta.env.VITE_GROQ_API_KEY}`,
       "Content-Type": "application/json",
     },
@@ -57,6 +68,49 @@ async function callGroq(messages) {
   return data.choices[0].message.content;
 }
 
+function renderMarkdown(text) {
+  const lines = text.split("\n");
+  const elements = [];
+  let key = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+
+    // Numbered list item
+    const numberedMatch = line.match(/^(\d+)\.\s+\*\*(.+?)\*\*(.*)$/);
+    if (numberedMatch) {
+      elements.push(
+        <div key={key++} style={{ marginBottom: "10px", display: "flex", gap: "8px" }}>
+          <span style={{ color: "var(--accent)", fontWeight: 500, flexShrink: 0 }}>{numberedMatch[1]}.</span>
+          <span><strong>{numberedMatch[2]}</strong>{numberedMatch[3]}</span>
+        </div>
+      );
+      continue;
+    }
+
+    // Inline bold: **text**
+    if (line.includes("**")) {
+      const parts = line.split(/\*\*(.+?)\*\*/g);
+      const rendered = parts.map((part, idx) =>
+        idx % 2 === 1 ? <strong key={idx}>{part}</strong> : part
+      );
+      elements.push(<p key={key++} style={{ marginBottom: "6px" }}>{rendered}</p>);
+      continue;
+    }
+
+    // Empty line → spacer
+    if (line.trim() === "") {
+      elements.push(<div key={key++} style={{ height: "6px" }} />);
+      continue;
+    }
+
+    // Normal line
+    elements.push(<p key={key++} style={{ marginBottom: "6px" }}>{line}</p>);
+  }
+
+  return elements;
+}
+
 export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
@@ -84,6 +138,9 @@ export default function App() {
 
     try {
       const { messages: packedMessages } = await fold.pack(CONVERSATION_ID, text);
+
+      // 🔍 Debug: see what Foldin is actually injecting
+      console.log("PACKED MESSAGES:", JSON.stringify(packedMessages, null, 2));
 
       // Tokens actually sent (packed)
       const tokensSent = Math.round(JSON.stringify(packedMessages).length / 4);
@@ -159,7 +216,6 @@ export default function App() {
           width: 100%;
         }
 
-        /* Header */
         .header {
           padding: 18px 32px;
           border-bottom: 1px solid var(--border);
@@ -175,6 +231,7 @@ export default function App() {
           align-items: baseline;
           gap: 10px;
         }
+          
 
         .header-title {
           font-family: var(--font-display);
@@ -193,7 +250,6 @@ export default function App() {
           font-weight: 400;
         }
 
-        /* Stats bar */
         .stats-bar {
           display: flex;
           align-items: center;
@@ -232,7 +288,6 @@ export default function App() {
           background: var(--border);
         }
 
-        /* Messages */
         .messages {
           flex: 1;
           overflow-y: auto;
@@ -339,7 +394,6 @@ export default function App() {
         .dot:nth-child(2) { animation-delay: 0.2s; }
         .dot:nth-child(3) { animation-delay: 0.4s; }
 
-        /* Input */
         .input-area {
           padding: 16px 32px 28px;
           flex-shrink: 0;
@@ -418,6 +472,25 @@ export default function App() {
             <h1 className="header-title">chit<span>chat</span></h1>
             <span className="header-model">Llama 3.3 · 70B</span>
           </div>
+          <button onClick={handleNewChat} style={{
+  background: "transparent",
+  border: "1px solid var(--border)",
+  color: "var(--muted)",
+  borderRadius: "8px",
+  padding: "6px 12px",
+  fontSize: "11px",
+  cursor: "pointer",
+  letterSpacing: "0.06em",
+  textTransform: "uppercase",
+  fontFamily: "var(--font-body)",
+  transition: "border-color 0.2s, color 0.2s",
+}}
+  onMouseEnter={e => { e.target.style.borderColor = "var(--accent)"; e.target.style.color = "var(--accent)"; }}
+  onMouseLeave={e => { e.target.style.borderColor = "var(--border)"; e.target.style.color = "var(--muted)"; }}
+>
+  New Chat
+</button>
+
 
           {stats && (
             <div className="stats-bar">
@@ -452,7 +525,9 @@ export default function App() {
                   <div className={`role-label ${msg.role === "assistant" ? "accent" : ""}`}>
                     {msg.role === "user" ? "You" : "Foldin"}
                   </div>
-                  <div className={`bubble ${msg.role}`}>{msg.content}</div>
+                  <div className={`bubble ${msg.role}`}>
+                    {msg.role === "assistant" ? renderMarkdown(msg.content) : msg.content}
+                  </div>
                 </div>
               ))}
               {loading && (
