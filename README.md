@@ -4,7 +4,7 @@ A minimal AI chatbot that uses [Foldin](https://www.npmjs.com/package/@vedsu/fol
 
 Built with **React + Vite + Groq**.
 
-![ChitChat showing 85% token savings](./screenshot.png)
+<img width="982" height="923" alt="image" src="https://github.com/user-attachments/assets/87dac62a-d35a-46ad-a160-25261d5564c0" />
 
 > **85% fewer tokens sent** after just 2 turns — 454 tokens with Foldin vs 3111 without.
 
