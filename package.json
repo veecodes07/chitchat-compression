@@ -10,7 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@vedsu/foldin": "^0.1.5",
+    "@vedsu/foldin": "^0.1.9",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
   },

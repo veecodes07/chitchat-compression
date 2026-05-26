@@ -1,12 +1,10 @@
-import { useState, useRef, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import createFold from "@vedsu/foldin";
 
-const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY;
-const CHAT_MODEL = "llama-3.3-70b-versatile";
-const COMPRESS_MODEL = "llama-3.1-8b-instant";
+const CHAT_MODEL = "llama3.2:3b";
+const COMPRESS_MODEL = "llama3.2:3b";
 const CONVERSATION_ID = "chat-001";
 
-// ─── localStorage storage (survives Vite HMR reloads) ────────────────────────
 const storage = {
   get: async (id) => {
     const val = localStorage.getItem(`foldin:${id}`);
@@ -17,55 +15,56 @@ const storage = {
   },
 };
 
-function handleNewChat() {
-  fold.reset(CONVERSATION_ID);
-  localStorage.removeItem(`foldin:${CONVERSATION_ID}`);
-  setMessages([]);
-  setStats(null);
-  setTotalSaved(0);
-  cumulativeRaw.current = 0;
-  cumulativeSent.current = 0;
-}
-
-// ─── Compress function ────────────────────────────────────────────────────────
 const compress = async (prompt) => {
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const res = await fetch("http://localhost:11434/api/chat", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${import.meta.env.VITE_GROQ_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model: COMPRESS_MODEL,
       messages: [{ role: "user", content: prompt }],
-      max_tokens: 300,
+      stream: false,
     }),
   });
+
   const data = await res.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.choices[0].message.content;
+  if (!res.ok) {
+    throw new Error(data?.error || `Compression failed with status ${res.status}`);
+  }
+  if (data.error) throw new Error(data.error.message || data.error);
+  return data.message.content;
 };
 
-// ─── Fold instance ────────────────────────────────────────────────────────────
 const fold = createFold({ storage, compress });
 
-// ─── Chat API call ────────────────────────────────────────────────────────────
-async function callGroq(messages) {
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+async function callAI(messages) {
+  const res = await fetch("http://localhost:11434/api/chat", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${import.meta.env.VITE_GROQ_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model: CHAT_MODEL,
       messages,
-      max_tokens: 1000,
+      stream: false,
     }),
   });
+
   const data = await res.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.choices[0].message.content;
+  if (!res.ok) {
+    throw new Error(data?.error || `Chat failed with status ${res.status}`);
+  }
+  if (data.error) throw new Error(data.error.message || data.error);
+  return data.message.content;
+}
+
+function estimateTokens(messages) {
+  const text = messages
+    .map((m) => `${m.role}: ${m.content}`)
+    .join("\n");
+
+  return Math.max(1, Math.round(text.length / 4));
 }
 
 function renderMarkdown(text) {
@@ -73,39 +72,46 @@ function renderMarkdown(text) {
   const elements = [];
   let key = 0;
 
-  for (let i = 0; i < lines.length; i++) {
-    let line = lines[i];
-
-    // Numbered list item
+  for (const line of lines) {
     const numberedMatch = line.match(/^(\d+)\.\s+\*\*(.+?)\*\*(.*)$/);
     if (numberedMatch) {
       elements.push(
-        <div key={key++} style={{ marginBottom: "10px", display: "flex", gap: "8px" }}>
-          <span style={{ color: "var(--accent)", fontWeight: 500, flexShrink: 0 }}>{numberedMatch[1]}.</span>
-          <span><strong>{numberedMatch[2]}</strong>{numberedMatch[3]}</span>
+        <div key={key++} style={{ marginBottom: 10, display: "flex", gap: 8 }}>
+          <span style={{ color: "var(--accent)", fontWeight: 500, flexShrink: 0 }}>
+            {numberedMatch[1]}.
+          </span>
+          <span>
+            <strong>{numberedMatch[2]}</strong>
+            {numberedMatch[3]}
+          </span>
         </div>
       );
       continue;
     }
 
-    // Inline bold: **text**
     if (line.includes("**")) {
       const parts = line.split(/\*\*(.+?)\*\*/g);
       const rendered = parts.map((part, idx) =>
         idx % 2 === 1 ? <strong key={idx}>{part}</strong> : part
       );
-      elements.push(<p key={key++} style={{ marginBottom: "6px" }}>{rendered}</p>);
+      elements.push(
+        <p key={key++} style={{ marginBottom: 6 }}>
+          {rendered}
+        </p>
+      );
       continue;
     }
 
-    // Empty line → spacer
     if (line.trim() === "") {
-      elements.push(<div key={key++} style={{ height: "6px" }} />);
+      elements.push(<div key={key++} style={{ height: 6 }} />);
       continue;
     }
 
-    // Normal line
-    elements.push(<p key={key++} style={{ marginBottom: "6px" }}>{line}</p>);
+    elements.push(
+      <p key={key++} style={{ marginBottom: 6 }}>
+        {line}
+      </p>
+    );
   }
 
   return elements;
@@ -115,16 +121,42 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [stats, setStats] = useState(null);
-  const [totalSaved, setTotalSaved] = useState(0);
+  const [turnCount, setTurnCount] = useState(0);
+
+  // totalTokensSent: running sum of tokens actually sent each turn (with Foldin)
+  const [totalTokensSent, setTotalTokensSent] = useState(0);
+  // totalTokensRaw: running sum of tokens that WOULD have been sent each turn (naive, no compression)
+  const [totalTokensRaw, setTotalTokensRaw] = useState(0);
+
+  // Tracks the full uncompressed history for naive cost simulation
+  const rawHistoryRef = useRef([]);
+
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
-  const cumulativeRaw = useRef(0);
-  const cumulativeSent = useRef(0);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
+  useEffect(() => {
+  localStorage.removeItem(`foldin:${CONVERSATION_ID}`);
+  fold.reset(CONVERSATION_ID);
+  setTurnCount(0);
+  setTotalTokensSent(0);
+  setTotalTokensRaw(0);
+  rawHistoryRef.current = [];
+}, []);
+
+  function handleNewChat() {
+    fold.reset(CONVERSATION_ID);
+    localStorage.removeItem(`foldin:${CONVERSATION_ID}`);
+    setMessages([]);
+    setTurnCount(0);
+    setTotalTokensSent(0);
+    setTotalTokensRaw(0);
+    rawHistoryRef.current = [];
+    setInput("");
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }
 
   async function handleSend() {
     const text = input.trim();
@@ -132,40 +164,63 @@ export default function App() {
 
     const userMsg = { role: "user", content: text };
     const newMessages = [...messages, userMsg];
+
     setMessages(newMessages);
     setInput("");
     setLoading(true);
 
     try {
+      // --- Foldin cost: what we actually send this turn (compressed) ---
       const { messages: packedMessages } = await fold.pack(CONVERSATION_ID, text);
+      const packedTurnTokens = estimateTokens(packedMessages);
 
-      // 🔍 Debug: see what Foldin is actually injecting
-      console.log("PACKED MESSAGES:", JSON.stringify(packedMessages, null, 2));
+      // DEBUG — remove once compression is verified working
+      console.group(`[Foldin] Turn ${rawHistoryRef.current.length / 2 + 1}`);
+      console.log("packed message count:", packedMessages.length);
+      console.log("packed tokens (estimated):", packedTurnTokens);
+      console.log("raw history length:", rawHistoryRef.current.length);
+      console.log("packed messages:", JSON.stringify(packedMessages, null, 2));
+      console.groupEnd();
 
-      // Tokens actually sent (packed)
-      const tokensSent = Math.round(JSON.stringify(packedMessages).length / 4);
-
-      // Tokens that would've been sent (full raw history)
-      const rawHistory = newMessages.map(m => m.content).join(" ");
-      const tokensWouldBe = Math.round(rawHistory.length / 4);
-
-      const reply = await callGroq(packedMessages);
+      const reply = await callAI(packedMessages);
       fold.update(CONVERSATION_ID, text, reply);
+      setTurnCount((prev) => prev + 1);
 
-      // Accumulate totals
-      cumulativeRaw.current += tokensWouldBe;
-      cumulativeSent.current += tokensSent;
-      const savedPct = Math.max(0, Math.round((1 - cumulativeSent.current / cumulativeRaw.current) * 100));
-      const savedTokens = cumulativeRaw.current - cumulativeSent.current;
+      // Update raw history to include this full turn (user + assistant)
+      rawHistoryRef.current = [
+        ...rawHistoryRef.current,
+        { role: "user", content: text },
+        { role: "assistant", content: reply },
+      ];
 
-      setStats({ tokensSent, tokensWouldBe, savedPct });
-      setTotalSaved(savedTokens);
+      // --- Compare same-turn context window sizes ---
+      // Naive: the full uncompressed history is what a naive client would send
+      //        on the NEXT turn — this is a point-in-time snapshot, not a sum.
+      // Foldin: running sum of what was actually sent each turn (packed tokens).
+      //
+      // Displaying snapshot vs sum gives: "if you sent one message right now,
+      // naive would cost X tokens; Foldin has cost Y tokens across all turns so far."
+      // Better comparison: both as snapshots of THIS turn's cost.
+      //
+      // Naive this turn = full history that was the input context for this turn
+      // = rawHistory BEFORE adding the reply (what was sent in to get the reply)
+      const naiveThisTurnSnapshot = estimateTokens([
+        ...rawHistoryRef.current.slice(0, -2), // history before this turn
+        { role: "user", content: text },        // the user message sent this turn
+      ]);
+
+      setTotalTokensRaw((prev) => prev + naiveThisTurnSnapshot);
+      setTotalTokensSent((prev) => prev + packedTurnTokens);
+
       setMessages([...newMessages, { role: "assistant", content: reply }]);
     } catch (err) {
-      setMessages([...newMessages, { role: "assistant", content: `Error: ${err.message}` }]);
+      setMessages([
+        ...newMessages,
+        { role: "assistant", content: `Error: ${err.message}` },
+      ]);
     } finally {
       setLoading(false);
-      inputRef.current?.focus();
+      requestAnimationFrame(() => inputRef.current?.focus());
     }
   }
 
@@ -175,6 +230,14 @@ export default function App() {
       handleSend();
     }
   }
+
+  const tokensSaved = totalTokensRaw - totalTokensSent;
+  const savingsPct = totalTokensRaw > 0
+    ? Math.round((tokensSaved / totalTokensRaw) * 100)
+    : 0;
+
+  // Only show stats once there's enough history for compression to kick in
+  const showStats = turnCount >= 1 && totalTokensRaw > 0;
 
   return (
     <>
@@ -191,19 +254,19 @@ export default function App() {
           --muted: #6b6966;
           --accent: #c9a96e;
           --green: #6fba8a;
+          --red: #e07070;
           --radius: 16px;
           --font-display: 'DM Serif Display', serif;
           --font-body: 'DM Sans', sans-serif;
         }
+
+        html, body, #root { height: 100%; }
 
         body {
           background: var(--bg);
           color: var(--text);
           font-family: var(--font-body);
           font-weight: 300;
-          height: 100dvh;
-          display: flex;
-          flex-direction: column;
           overflow: hidden;
         }
 
@@ -222,8 +285,8 @@ export default function App() {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          flex-shrink: 0;
           gap: 12px;
+          flex-shrink: 0;
         }
 
         .header-left {
@@ -231,7 +294,6 @@ export default function App() {
           align-items: baseline;
           gap: 10px;
         }
-          
 
         .header-title {
           font-family: var(--font-display);
@@ -249,6 +311,22 @@ export default function App() {
           text-transform: uppercase;
           font-weight: 400;
         }
+
+        .new-chat-btn {
+          background: transparent;
+          border: 1px solid var(--border);
+          color: var(--muted);
+          border-radius: 8px;
+          padding: 6px 12px;
+          font-size: 11px;
+          cursor: pointer;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+          font-family: var(--font-body);
+          transition: border-color 0.2s, color 0.2s;
+        }
+
+        .new-chat-btn:hover { border-color: var(--accent); color: var(--accent); }
 
         .stats-bar {
           display: flex;
@@ -272,7 +350,8 @@ export default function App() {
         }
 
         .stat-value.green { color: var(--green); }
-        .stat-value.accent { color: var(--accent); }
+        .stat-value.red { color: var(--red); }
+        .stat-value.muted { color: var(--muted); font-size: 11px; }
 
         .stat-label {
           font-size: 9px;
@@ -282,11 +361,7 @@ export default function App() {
           font-weight: 400;
         }
 
-        .stat-divider {
-          width: 1px;
-          height: 24px;
-          background: var(--border);
-        }
+        .stat-divider { width: 1px; height: 24px; background: var(--border); }
 
         .messages {
           flex: 1;
@@ -351,7 +426,7 @@ export default function App() {
         }
 
         .bubble.user {
-          background: var(--user-bg, #1c1c1e);
+          background: #1c1c1e;
           border: 1px solid var(--border);
           border-bottom-right-radius: 4px;
           color: var(--text);
@@ -469,54 +544,65 @@ export default function App() {
       <div className="app">
         <header className="header">
           <div className="header-left">
-            <h1 className="header-title">chit<span>chat</span></h1>
+            <h1 className="header-title">
+              chit<span>chat</span>
+            </h1>
             <span className="header-model">Llama 3.3 · 70B</span>
           </div>
-          <button onClick={handleNewChat} style={{
-  background: "transparent",
-  border: "1px solid var(--border)",
-  color: "var(--muted)",
-  borderRadius: "8px",
-  padding: "6px 12px",
-  fontSize: "11px",
-  cursor: "pointer",
-  letterSpacing: "0.06em",
-  textTransform: "uppercase",
-  fontFamily: "var(--font-body)",
-  transition: "border-color 0.2s, color 0.2s",
-}}
-  onMouseEnter={e => { e.target.style.borderColor = "var(--accent)"; e.target.style.color = "var(--accent)"; }}
-  onMouseLeave={e => { e.target.style.borderColor = "var(--border)"; e.target.style.color = "var(--muted)"; }}
->
-  New Chat
-</button>
 
-
-          {stats && (
+          {showStats && (
             <div className="stats-bar">
               <div className="stat">
-                <span className="stat-value">{stats.tokensSent}</span>
-                <span className="stat-label">Tokens sent</span>
+  <span className="stat-value">{turnCount}</span>
+  <span className="stat-label">Turns</span>
+</div>
+<div className="stat-divider" />
+              <div className="stat">
+                <span className="stat-value">{totalTokensSent}</span>
+                <span className="stat-label">With Foldin</span>
               </div>
               <div className="stat-divider" />
               <div className="stat">
-                <span className="stat-value">{stats.tokensWouldBe}</span>
+                <span className="stat-value">{totalTokensRaw}</span>
                 <span className="stat-label">Without Foldin</span>
               </div>
               <div className="stat-divider" />
               <div className="stat">
-                <span className="stat-value green">{stats.savedPct}% saved</span>
-                <span className="stat-label">{totalSaved} tokens total</span>
+               {turnCount <= 2 ? (
+  <>
+    <span className="stat-value muted">warming up</span>
+    <span className="stat-label">compression ramping</span>
+  </>
+) : tokensSaved >= 0 ? (
+  <>
+    <span className="stat-value green">{savingsPct}% saved</span>
+    <span className="stat-label">{tokensSaved} tokens total</span>
+  </>
+) : (
+  <>
+    <span className="stat-value green">{savingsPct}% saved</span>
+    <span className="stat-label">{tokensSaved} tokens total</span>
+  </>
+)}
               </div>
             </div>
           )}
+
+          <button className="new-chat-btn" onClick={handleNewChat}>
+            New chat
+          </button>
         </header>
 
         <div className="messages">
           {messages.length === 0 && !loading ? (
             <div className="empty">
-              <div className="empty-title">What's on your <em>mind?</em></div>
-              <p className="empty-sub">Chat normally. ChitChat compresses context in the background — saving tokens every turn.</p>
+              <div className="empty-title">
+                What&apos;s on your <em>mind?</em>
+              </div>
+              <p className="empty-sub">
+                Chat normally. ChitChat compresses context in the background —
+                saving tokens every turn.
+              </p>
             </div>
           ) : (
             <>
@@ -530,9 +616,10 @@ export default function App() {
                   </div>
                 </div>
               ))}
+
               {loading && (
                 <div className="message-row assistant">
-                  <div className="role-label accent">Fold</div>
+                  <div className="role-label accent">Foldin</div>
                   <div className="typing">
                     <div className="dot" />
                     <div className="dot" />
@@ -553,13 +640,14 @@ export default function App() {
               onChange={(e) => {
                 setInput(e.target.value);
                 e.target.style.height = "22px";
-                e.target.style.height = Math.min(e.target.scrollHeight, 140) + "px";
+                e.target.style.height = `${Math.min(e.target.scrollHeight, 140)}px`;
               }}
               onKeyDown={handleKeyDown}
               placeholder="Say something..."
               rows={1}
               autoFocus
             />
+
             <button
               className="send-btn"
               onClick={handleSend}
@@ -567,7 +655,13 @@ export default function App() {
               aria-label="Send"
             >
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                <path d="M2 8L14 8M14 8L9 3M14 8L9 13" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+                <path
+                  d="M2 8L14 8M14 8L9 3M14 8L9 13"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
               </svg>
             </button>
           </div>
